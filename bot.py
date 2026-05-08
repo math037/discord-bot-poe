@@ -1,5 +1,4 @@
 import os
-import json
 import aiohttp
 import discord
 from dotenv import load_dotenv
@@ -7,10 +6,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
-POE_API_KEY = os.environ["POE_API_KEY"]
+HF_API_KEY = os.environ["HF_API_KEY"]
 
-POE_BOT_NAME = os.environ.get("POE_BOT_NAME", "Claude-3.5-Sonnet")
-POE_API_URL = "https://api.poe.com/api/query"
+HF_API_URL = "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.1"
 
 # Discord message length limit
 DISCORD_MAX_LENGTH = 2000
@@ -21,60 +19,48 @@ intents.message_content = True
 client = discord.Client(intents=intents)
 
 
-async def get_poe_response(user_message: str) -> str:
-    """Call the Poe HTTP API directly and return the full reply text."""
+async def get_hf_response(user_message: str) -> str:
+    """Call the Hugging Face Inference API and return the generated text."""
+    # Mistral instruct format
+    prompt = f"<s>[INST] {user_message} [/INST]"
     payload = {
-        "query": [{"role": "user", "content": user_message}],
-        "bot_name": POE_BOT_NAME,
-        "api_key": POE_API_KEY,
+        "inputs": prompt,
+        "parameters": {
+            "max_new_tokens": 512,
+            "temperature": 0.7,
+            "return_full_text": False,
+        },
     }
     headers = {
-        "Authorization": f"Bearer {POE_API_KEY}",
+        "Authorization": f"Bearer {HF_API_KEY}",
         "Content-Type": "application/json",
-        "Accept": "application/json",
     }
 
     async with aiohttp.ClientSession() as session:
         async with session.post(
-            POE_API_URL,
+            HF_API_URL,
             json=payload,
             headers=headers,
             timeout=aiohttp.ClientTimeout(total=60),
         ) as resp:
+            if resp.status == 503:
+                # Model is loading — surface a friendly message
+                raise RuntimeError(
+                    "The AI model is currently loading. Please try again in a moment."
+                )
             if resp.status != 200:
                 body = await resp.text()
                 raise RuntimeError(
-                    f"Poe API returned HTTP {resp.status}: {body[:200]}"
+                    f"Hugging Face API returned HTTP {resp.status}: {body[:200]}"
                 )
 
-            # The Poe query endpoint returns server-sent events (text/event-stream).
-            # Each line is either "data: <json>" or blank/comment.
-            reply_parts: list[str] = []
-            async for raw_line in resp.content:
-                line = raw_line.decode("utf-8").rstrip("\n")
-                if not line.startswith("data: "):
-                    continue
-                data_str = line[len("data: "):]
-                if data_str.strip() in ("", "[DONE]"):
-                    continue
-                try:
-                    event = json.loads(data_str)
-                except json.JSONDecodeError:
-                    continue
+            data = await resp.json()
 
-                event_type = event.get("event")
-                if event_type == "text":
-                    reply_parts.append(event.get("data", {}).get("text", ""))
-                elif event_type == "replace_response":
-                    # Replace the entire accumulated response so far
-                    reply_parts = [event.get("data", {}).get("text", "")]
-                elif event_type == "error":
-                    error_msg = event.get("data", {}).get("text", "Unknown error")
-                    raise RuntimeError(f"Poe API error event: {error_msg}")
-                elif event_type == "done":
-                    break
+            # Response is a list of dicts: [{"generated_text": "..."}]
+            if isinstance(data, list) and data:
+                return data[0].get("generated_text", "").strip()
 
-            return "".join(reply_parts).strip()
+            raise RuntimeError(f"Unexpected response format: {str(data)[:200]}")
 
 
 def split_message(text: str, limit: int = DISCORD_MAX_LENGTH) -> list[str]:
@@ -91,7 +77,7 @@ def split_message(text: str, limit: int = DISCORD_MAX_LENGTH) -> list[str]:
 @client.event
 async def on_ready():
     print(f"Logged in as {client.user} (ID: {client.user.id})")
-    print(f"Using Poe bot: {POE_BOT_NAME}")
+    print("Using Hugging Face Inference API (mistralai/Mistral-7B-Instruct-v0.1)")
 
 
 @client.event
@@ -122,7 +108,7 @@ async def on_message(message: discord.Message):
 
     async with message.channel.typing():
         try:
-            reply = await get_poe_response(content)
+            reply = await get_hf_response(content)
             if not reply:
                 await message.reply("⚠️ Received an empty response. Please try again.")
                 return
@@ -134,15 +120,16 @@ async def on_message(message: discord.Message):
                 else:
                     await message.channel.send(chunk)
         except RuntimeError as exc:
-            print(f"Poe API error: {exc}")
-            await message.reply("⚠️ Poe API returned an error. Please try again later.")
+            print(f"Hugging Face API error: {exc}")
+            await message.reply(f"⚠️ {exc}")
         except aiohttp.ClientError as exc:
-            print(f"HTTP error calling Poe API: {exc}")
-            await message.reply("⚠️ Could not reach Poe API. Please try again later.")
+            print(f"HTTP error calling Hugging Face API: {exc}")
+            await message.reply("⚠️ Could not reach the AI API. Please try again later.")
         except Exception as exc:
             print(f"Unexpected error: {exc}")
             await message.reply("⚠️ Something went wrong. Please try again later.")
 
 
 client.run(DISCORD_TOKEN)
+
 
