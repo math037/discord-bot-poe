@@ -53,7 +53,7 @@ async def on_message(message: discord.Message):
             f"<@!{client.user.id}>", ""
         ).strip()
 
-    if not content:
+    if not content and is_mentioned:
         await message.reply("Hey! Ask me anything.")
         return
 
