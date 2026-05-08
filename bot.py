@@ -8,7 +8,7 @@ load_dotenv()
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 POE_API_KEY = os.environ["POE_API_KEY"]
 
-POE_BOT_NAME = "GPT-4o-Mini"
+POE_BOT_NAME = "Claude-3.5-Sonnet"
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -62,7 +62,7 @@ async def on_message(message: discord.Message):
             reply = await get_poe_response(content)
             await message.reply(reply)
         except fp.BotError as exc:
-            print(f"Poe API error: {exc}")
+            print(f"Poe BotError [{type(exc).__name__}]: {exc!r}")
             await message.reply(
                 f"⚠️ Poe API returned an error. Please try again later."
             )
