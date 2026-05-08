@@ -1,9 +1,10 @@
 import asyncio
 import logging
 import os
+
 import aiohttp
 import discord
-from discord.errors import LoginFailure
+from discord.errors import HTTPException, LoginFailure
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -18,72 +19,20 @@ logger = logging.getLogger(__name__)
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 HF_API_KEY = os.environ["HF_API_KEY"]
 
-HF_API_URL = "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.1"
+HF_API_URL = (
+    "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.1"
+)
 
 # Discord message length limit
 DISCORD_MAX_LENGTH = 2000
 
-intents = discord.Intents.default()
-intents.message_content = True
-
-# Module-level session reference — set once in main() before the bot starts.
-# All HF API calls share this single session for the lifetime of the process.
-_session: aiohttp.ClientSession | None = None
-
-
-async def get_hf_response(user_message: str) -> str:
-    """Call the Hugging Face Inference API and return the generated text.
-
-    Reuses the module-level ``_session`` that was created at startup so that
-    the same underlying TCP connection pool is used for every request and no
-    new session is opened (or closed) per call.
-    """
-    if _session is None or _session.closed:
-        raise RuntimeError("HTTP session is not available.")
-
-    # Mistral instruct format
-    prompt = f"<s>[INST] {user_message} [/INST]"
-    payload = {
-        "inputs": prompt,
-        "parameters": {
-            "max_new_tokens": 512,
-            "temperature": 0.7,
-            "return_full_text": False,
-        },
-    }
-    headers = {
-        "Authorization": f"Bearer {HF_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-    async with _session.post(
-        HF_API_URL,
-        json=payload,
-        headers=headers,
-        timeout=aiohttp.ClientTimeout(total=60),
-    ) as resp:
-        if resp.status == 503:
-            # Model is loading — surface a friendly message
-            raise RuntimeError(
-                "The AI model is currently loading. Please try again in a moment."
-            )
-        if resp.status != 200:
-            body = await resp.text()
-            raise RuntimeError(
-                f"Hugging Face API returned HTTP {resp.status}: {body[:200]}"
-            )
-
-        data = await resp.json()
-
-        # Response is a list of dicts: [{"generated_text": "..."}]
-        if isinstance(data, list) and data:
-            return data[0].get("generated_text", "").strip()
-
-        raise RuntimeError(f"Unexpected response format: {str(data)[:200]}")
+# How long to wait (seconds) before retrying a loading model (503)
+HF_MODEL_LOADING_RETRY_DELAY = 10
+HF_MODEL_LOADING_MAX_RETRIES = 6
 
 
 def split_message(text: str, limit: int = DISCORD_MAX_LENGTH) -> list[str]:
-    """Split a long message into chunks that fit within Discord's limit."""
+    """Split *text* into chunks that each fit within Discord's character limit."""
     if len(text) <= limit:
         return [text]
     chunks: list[str] = []
@@ -93,117 +42,272 @@ def split_message(text: str, limit: int = DISCORD_MAX_LENGTH) -> list[str]:
     return chunks
 
 
-def make_client(connector: aiohttp.TCPConnector) -> discord.Client:
-    """Create and return a Discord client wired to the shared connector."""
-    _client = discord.Client(intents=intents, connector=connector)
+class DiscordBot(discord.Client):
+    """A Discord bot that responds to @mentions with Hugging Face AI responses.
 
-    @_client.event
-    async def on_ready():
-        logger.info(f"Logged in as {_client.user} (ID: {_client.user.id})")
+    Design principles
+    -----------------
+    * One ``aiohttp.ClientSession`` is created in ``setup_hook`` (called by
+      discord.py before the gateway connection is opened) and closed in
+      ``close``.  It is never recreated — discord.py's built-in reconnect
+      logic handles all gateway drops without touching the HTTP session.
+    * Rate-limit responses from Discord (HTTP 429) are caught and retried
+      after the ``retry_after`` delay reported in the exception.
+    * Hugging Face 503 "model loading" responses are retried with backoff
+      rather than surfacing an error immediately.
+    * All event-handler exceptions are caught so the bot never crashes on a
+      single bad message.
+    """
+
+    def __init__(self) -> None:
+        intents = discord.Intents.default()
+        intents.message_content = True
+        # connector_owner=False: we manage the connector's lifetime ourselves
+        # in setup_hook / close so discord.py doesn't close it prematurely.
+        self._connector = aiohttp.TCPConnector()
+        super().__init__(
+            intents=intents,
+            connector=self._connector,
+            connector_owner=False,
+        )
+        self._session: aiohttp.ClientSession | None = None
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    async def setup_hook(self) -> None:
+        """Called by discord.py once, before the gateway connection opens.
+
+        This is the correct place to create async resources that must exist
+        for the lifetime of the bot.
+        """
+        self._session = aiohttp.ClientSession(
+            connector=self._connector,
+            connector_owner=False,
+        )
+        logger.info("HTTP session created.")
+
+    async def close(self) -> None:
+        """Cleanly shut down the HTTP session and connector, then the gateway."""
+        logger.info("Shutting down — closing HTTP session …")
+        if self._session and not self._session.closed:
+            await self._session.close()
+        if not self._connector.closed:
+            await self._connector.close()
+        await super().close()
+        logger.info("Shutdown complete.")
+
+    # ------------------------------------------------------------------
+    # Discord events
+    # ------------------------------------------------------------------
+
+    async def on_ready(self) -> None:
+        logger.info("Logged in as %s (ID: %s)", self.user, self.user.id)
         logger.info(
             "Using Hugging Face Inference API (mistralai/Mistral-7B-Instruct-v0.1)"
         )
 
-    @_client.event
-    async def on_message(message: discord.Message):
-        # Ignore messages sent by the bot itself
-        if message.author == _client.user:
+    async def on_message(self, message: discord.Message) -> None:
+        # Ignore our own messages
+        if message.author == self.user:
             return
 
-        # Only respond to @mentions and DMs
-        is_dm = isinstance(message.channel, discord.DMChannel)
-        is_mentioned = _client.user in message.mentions
-        if not is_dm and not is_mentioned:
+        # Only respond to @mentions
+        if self.user not in message.mentions:
             return
 
-        # Strip the bot mention from the message content
-        content = message.content
-        if is_mentioned:
-            content = (
-                content
-                .replace(f"<@{_client.user.id}>", "")
-                .replace(f"<@!{_client.user.id}>", "")
-                .strip()
-            )
+        # Strip the bot mention(s) from the message text
+        content = (
+            message.content
+            .replace(f"<@{self.user.id}>", "")
+            .replace(f"<@!{self.user.id}>", "")
+            .strip()
+        )
 
         if not content:
-            await message.reply("Hey! Ask me anything.")
+            await self._safe_reply(message, "Hey! Ask me anything.")
             return
+
+        logger.info(
+            "Mention from %s in channel %s: %r",
+            message.author,
+            message.channel,
+            content[:80],
+        )
 
         async with message.channel.typing():
             try:
-                reply = await get_hf_response(content)
-                if not reply:
-                    await message.reply(
-                        "⚠️ Received an empty response. Please try again."
-                    )
-                    return
-                # Send reply in chunks if it exceeds Discord's 2000-char limit
-                chunks = split_message(reply)
-                for i, chunk in enumerate(chunks):
-                    if i == 0:
-                        await message.reply(chunk)
-                    else:
-                        await message.channel.send(chunk)
-            except RuntimeError as exc:
-                logger.error(f"Hugging Face API error: {exc}")
-                await message.reply(f"⚠️ {exc}")
-            except aiohttp.ClientError as exc:
-                logger.error(f"HTTP error calling Hugging Face API: {exc}")
-                await message.reply(
-                    "⚠️ Could not reach the AI API. Please try again later."
-                )
+                reply = await self._get_hf_response(content)
             except Exception as exc:
-                logger.error(f"Unexpected error: {exc}")
-                await message.reply(
+                logger.error("Failed to get HF response: %s", exc)
+                await self._safe_reply(
+                    message, f"⚠️ {exc}" if isinstance(exc, RuntimeError) else
                     "⚠️ Something went wrong. Please try again later."
                 )
+                return
 
-    return _client
+        if not reply:
+            await self._safe_reply(
+                message, "⚠️ Received an empty response. Please try again."
+            )
+            return
+
+        # Send reply in chunks if it exceeds Discord's 2000-char limit
+        chunks = split_message(reply)
+        for i, chunk in enumerate(chunks):
+            if i == 0:
+                await self._safe_reply(message, chunk)
+            else:
+                await self._safe_send(message.channel, chunk)
+
+    async def on_error(self, event_method: str, *args, **kwargs) -> None:
+        """Catch-all so unhandled exceptions in events never crash the bot."""
+        logger.exception("Unhandled exception in event '%s'", event_method)
+
+    # ------------------------------------------------------------------
+    # Hugging Face API
+    # ------------------------------------------------------------------
+
+    async def _get_hf_response(self, user_message: str) -> str:
+        """Call the Hugging Face Inference API and return the generated text.
+
+        Retries automatically when the model is still loading (HTTP 503).
+        """
+        if self._session is None or self._session.closed:
+            raise RuntimeError("HTTP session is not available.")
+
+        prompt = f"<s>[INST] {user_message} [/INST]"
+        payload = {
+            "inputs": prompt,
+            "parameters": {
+                "max_new_tokens": 512,
+                "temperature": 0.7,
+                "return_full_text": False,
+            },
+        }
+        headers = {
+            "Authorization": f"Bearer {HF_API_KEY}",
+            "Content-Type": "application/json",
+        }
+
+        for attempt in range(1, HF_MODEL_LOADING_MAX_RETRIES + 1):
+            async with self._session.post(
+                HF_API_URL,
+                json=payload,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=60),
+            ) as resp:
+                if resp.status == 503:
+                    # Model is still loading — wait and retry
+                    if attempt < HF_MODEL_LOADING_MAX_RETRIES:
+                        logger.warning(
+                            "HF model loading (503), retry %d/%d in %ds …",
+                            attempt,
+                            HF_MODEL_LOADING_MAX_RETRIES,
+                            HF_MODEL_LOADING_RETRY_DELAY,
+                        )
+                        await asyncio.sleep(HF_MODEL_LOADING_RETRY_DELAY)
+                        continue
+                    raise RuntimeError(
+                        "The AI model is still loading after several retries. "
+                        "Please try again in a minute."
+                    )
+
+                if resp.status != 200:
+                    body = await resp.text()
+                    raise RuntimeError(
+                        f"Hugging Face API returned HTTP {resp.status}: {body[:200]}"
+                    )
+
+                data = await resp.json()
+
+                # Response format: [{"generated_text": "..."}]
+                if isinstance(data, list) and data:
+                    return data[0].get("generated_text", "").strip()
+
+                raise RuntimeError(
+                    f"Unexpected HF response format: {str(data)[:200]}"
+                )
+
+        # Should never reach here, but satisfy the type checker
+        raise RuntimeError("Hugging Face API request failed after all retries.")
+
+    # ------------------------------------------------------------------
+    # Helpers — Discord send wrappers that handle rate limits gracefully
+    # ------------------------------------------------------------------
+
+    async def _safe_reply(
+        self,
+        message: discord.Message,
+        content: str,
+        *,
+        max_retries: int = 5,
+    ) -> None:
+        """Reply to *message*, retrying on Discord rate limits (HTTP 429)."""
+        for attempt in range(1, max_retries + 1):
+            try:
+                await message.reply(content)
+                return
+            except HTTPException as exc:
+                if exc.status == 429:
+                    retry_after = getattr(exc, "retry_after", 5.0)
+                    logger.warning(
+                        "Discord rate limit on reply (attempt %d/%d), "
+                        "waiting %.1fs …",
+                        attempt,
+                        max_retries,
+                        retry_after,
+                    )
+                    await asyncio.sleep(retry_after)
+                else:
+                    logger.error("Discord HTTP error on reply: %s", exc)
+                    return
+        logger.error("Gave up replying after %d rate-limited attempts.", max_retries)
+
+    async def _safe_send(
+        self,
+        channel: discord.abc.Messageable,
+        content: str,
+        *,
+        max_retries: int = 5,
+    ) -> None:
+        """Send *content* to *channel*, retrying on Discord rate limits."""
+        for attempt in range(1, max_retries + 1):
+            try:
+                await channel.send(content)
+                return
+            except HTTPException as exc:
+                if exc.status == 429:
+                    retry_after = getattr(exc, "retry_after", 5.0)
+                    logger.warning(
+                        "Discord rate limit on send (attempt %d/%d), "
+                        "waiting %.1fs …",
+                        attempt,
+                        max_retries,
+                        retry_after,
+                    )
+                    await asyncio.sleep(retry_after)
+                else:
+                    logger.error("Discord HTTP error on send: %s", exc)
+                    return
+        logger.error("Gave up sending after %d rate-limited attempts.", max_retries)
 
 
 async def main() -> None:
-    """Entry point.
-
-    Creates a single ``aiohttp.ClientSession`` (backed by a ``TCPConnector``)
-    once, passes the connector to the Discord client so both share the same
-    connection pool, then starts the bot.  discord.py's ``reconnect=True``
-    (the default) handles all gateway-level reconnections internally, so no
-    outer retry loop is needed — and no new session is ever created on
-    reconnect.
-
-    The session is closed in the ``finally`` block so it is always cleaned up
-    on both clean shutdown and unexpected errors.
-    """
-    global _session
-
-    # A single connector / session for the entire process lifetime.
-    # connector_owner=False tells aiohttp.ClientSession not to close the
-    # connector when the session itself is closed — we manage its lifetime here.
-    connector = aiohttp.TCPConnector()
-    _session = aiohttp.ClientSession(connector=connector, connector_owner=False)
-
-    client = make_client(connector)
-
+    """Create the bot and run it, handling fatal startup errors cleanly."""
+    bot = DiscordBot()
     try:
         logger.info("Starting Discord bot …")
-        # reconnect=True (default) lets discord.py handle gateway drops,
-        # RESUME packets, and backoff entirely on its own.
-        await client.start(DISCORD_TOKEN, reconnect=True)
+        await bot.start(DISCORD_TOKEN, reconnect=True)
     except LoginFailure as exc:
         logger.critical("Invalid Discord token — cannot log in: %s", exc)
         raise
     except Exception as exc:
-        logger.error("Bot exited with error: %s", exc)
+        logger.error("Bot exited with unexpected error: %s", exc)
         raise
-    finally:
-        logger.info("Shutting down — closing HTTP session …")
-        if not _session.closed:
-            await _session.close()
-        if not connector.closed:
-            await connector.close()
-        logger.info("Shutdown complete.")
 
 
 asyncio.run(main())
+
 
