@@ -20,7 +20,7 @@ DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 HF_API_KEY = os.environ["HF_API_KEY"]
 
 HF_API_URL = (
-    "https://api-inference.huggingface.co/models/google/flan-t5-large"
+    "https://api-inference.huggingface.co/models/distilgpt2"
 )
 
 # Discord message length limit
@@ -105,7 +105,7 @@ class DiscordBot(discord.Client):
     async def on_ready(self) -> None:
         logger.info("Logged in as %s (ID: %s)", self.user, self.user.id)
         logger.info(
-            "Using Hugging Face Inference API (google/flan-t5-large)"
+            "Using Hugging Face Inference API (distilgpt2)"
         )
 
     async def on_message(self, message: discord.Message) -> None:
@@ -177,10 +177,15 @@ class DiscordBot(discord.Client):
         if self._session is None or self._session.closed:
             raise RuntimeError("HTTP session is not available.")
 
+        # distilgpt2 is a completion model: prefix the user message with a
+        # simple prompt label so the model has context, then strip the prompt
+        # from the returned text before sending it to Discord.
+        prompt = f"User: {user_message}\nBot:"
         payload = {
-            "inputs": user_message,
+            "inputs": prompt,
             "parameters": {
-                "max_new_tokens": 512,
+                "max_new_tokens": 200,
+                "return_full_text": False,
             },
         }
         headers = {
