@@ -20,7 +20,7 @@ DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 HF_API_KEY = os.environ["HF_API_KEY"]
 
 HF_API_URL = (
-    "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.1"
+    "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.2"
 )
 
 # Discord message length limit
@@ -105,7 +105,7 @@ class DiscordBot(discord.Client):
     async def on_ready(self) -> None:
         logger.info("Logged in as %s (ID: %s)", self.user, self.user.id)
         logger.info(
-            "Using Hugging Face Inference API (mistralai/Mistral-7B-Instruct-v0.1)"
+            "Using Hugging Face Inference API (mistralai/Mistral-7B-Instruct-v0.2)"
         )
 
     async def on_message(self, message: discord.Message) -> None:
