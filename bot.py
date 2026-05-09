@@ -20,7 +20,7 @@ DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 HF_API_KEY = os.environ["HF_API_KEY"]
 
 HF_API_URL = (
-    "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.2"
+    "https://api-inference.huggingface.co/models/google/flan-t5-large"
 )
 
 # Discord message length limit
@@ -105,7 +105,7 @@ class DiscordBot(discord.Client):
     async def on_ready(self) -> None:
         logger.info("Logged in as %s (ID: %s)", self.user, self.user.id)
         logger.info(
-            "Using Hugging Face Inference API (mistralai/Mistral-7B-Instruct-v0.2)"
+            "Using Hugging Face Inference API (google/flan-t5-large)"
         )
 
     async def on_message(self, message: discord.Message) -> None:
@@ -177,13 +177,10 @@ class DiscordBot(discord.Client):
         if self._session is None or self._session.closed:
             raise RuntimeError("HTTP session is not available.")
 
-        prompt = f"<s>[INST] {user_message} [/INST]"
         payload = {
-            "inputs": prompt,
+            "inputs": user_message,
             "parameters": {
                 "max_new_tokens": 512,
-                "temperature": 0.7,
-                "return_full_text": False,
             },
         }
         headers = {
